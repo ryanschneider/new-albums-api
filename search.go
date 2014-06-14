@@ -1,153 +1,152 @@
 package hello
 
 import (
-    "bytes"
-    "fmt"
-    "io"
-    "time"
-    
-    "crypto/md5"
-    "net/http"
-    
-    "appengine"
-    "appengine/urlfetch"
-    "appengine/memcache"
+	"bytes"
+	"fmt"
+	"io"
+	"time"
 
-    "github.com/bitly/go-simplejson"
+	"crypto/md5"
+	"net/http"
+
+	"appengine"
+	"appengine/memcache"
+	"appengine/urlfetch"
+
+	"github.com/bitly/go-simplejson"
 )
 
 func init() {
-    http.HandleFunc("/", handler)
+	http.HandleFunc("/", handler)
 }
 
 func parseInput(c appengine.Context, r *http.Request) (input []string, err error) {
-    defer r.Body.Close()
-    var buf bytes.Buffer
-    buf.ReadFrom(r.Body)
-    c.Debugf("POST body is %d", buf.Len())
-    b := buf.Bytes()
-    payload, err := simplejson.NewJson(b)
-    if err != nil {
-        return
-    }
+	defer r.Body.Close()
+	var buf bytes.Buffer
+	buf.ReadFrom(r.Body)
+	c.Debugf("POST body is %d", buf.Len())
+	b := buf.Bytes()
+	payload, err := simplejson.NewJson(b)
+	if err != nil {
+		return
+	}
 
-    /*
-    dbg, err := payload.EncodePretty()
-    if err != nil {
-        return
-    }
-    c.Debugf("POST body is %v", string(dbg))
-    */
+	/*
+	   dbg, err := payload.EncodePretty()
+	   if err != nil {
+	       return
+	   }
+	   c.Debugf("POST body is %v", string(dbg))
+	*/
 
-    search, err := payload.Get("search").Array()
-    if err != nil {
-        return
-    }    
+	search, err := payload.Get("search").Array()
+	if err != nil {
+		return
+	}
 
-    for _, value := range search {
-        i, ok := value.(string)
-        if ok {
-            input = append(input, i)
-        }
-    }
-    return
+	for _, value := range search {
+		i, ok := value.(string)
+		if ok {
+			input = append(input, i)
+		}
+	}
+	return
 }
 
 func getResults(c appengine.Context, requests []string) (results *simplejson.Json, err error) {
-    type AsyncResult struct {
-        request string
-        response *simplejson.Json
-        err error 
-    }
+	type AsyncResult struct {
+		request  string
+		response *simplejson.Json
+		err      error
+	}
 
-    done := make(chan AsyncResult)
-    results = simplejson.New()
+	done := make(chan AsyncResult, 5)
+	results = simplejson.New()
 
-    for _, r := range requests {
-        c.Infof("Request: %v", r)
-        go func(req string) {
-            h := md5.New()
-            io.WriteString(h, req)
-            key := fmt.Sprintf("%x", h.Sum(nil))
-            c.Debugf("Check memcached: %v as %v", req, key)
-            
-            if cache, err := memcache.Get(c, key); err == nil {
-                c.Debugf("Found memcached: %v as %v", req, key)
-                j, err := simplejson.NewJson(cache.Value)
-                result := AsyncResult{req, j, err}
-                done <- result    
-                return
-            }
+	for _, r := range requests {
+		c.Debugf("Request: %v", r)
+		go func(req string) {
+			h := md5.New()
+			io.WriteString(h, req)
+			key := fmt.Sprintf("%x", h.Sum(nil))
+			c.Debugf("Check memcached: %v as %v", req, key)
 
-            c.Debugf("Fetch: %v", req)
-            client := urlfetch.Client(c) 
-            resp, err := client.Get(req)
-            var buf bytes.Buffer
-            defer resp.Body.Close()
-            buf.ReadFrom(resp.Body)
-            b := buf.Bytes()
+			if cache, err := memcache.Get(c, key); err == nil {
+				c.Debugf("Found memcached: %v as %v", req, key)
+				j, err := simplejson.NewJson(cache.Value)
+				result := AsyncResult{req, j, err}
+				done <- result
+				return
+			}
 
-            //c.Debugf("Async: %v", string(b[:]))
-            if err == nil {
-                j, err := simplejson.NewJson(b)
-                timeout := 5 * time.Minute
-                cache := &memcache.Item{
-                    Key: key,
-                    Value: b,
-                    Expiration: timeout,
-                }
+			c.Debugf("Fetch: %v", req)
+			client := urlfetch.Client(c)
+			resp, err := client.Get(req)
+			var buf bytes.Buffer
+			defer resp.Body.Close()
+			buf.ReadFrom(resp.Body)
+			b := buf.Bytes()
 
-                if err := memcache.Add(c, cache); err != nil {
-                    c.Debugf("Memcache set err: %v", err.Error())
-                }
+			//c.Debugf("Async: %v", string(b[:]))
+			if err == nil {
+				j, err := simplejson.NewJson(b)
+				timeout := 5 * time.Minute
+				cache := &memcache.Item{
+					Key:        key,
+					Value:      b,
+					Expiration: timeout,
+				}
 
-                result := AsyncResult{req, j, err}
-                done <- result
-            } else {
-                c.Errorf("ERROR: %v", err.Error())
-                result := AsyncResult{ req, nil, err }
-                done <- result
-            }
-        }(r)
-    }
+				if err := memcache.Add(c, cache); err != nil {
+					c.Debugf("Memcache set err: %v", err.Error())
+				}
 
-    c.Debugf("Waiting for %d asyncs", len(requests))
-    for i := 0; i < len(requests); i++ {
-        if result := <-done; result.err == nil {
-            results.Set(result.request, result.response)
-        } 
-    }
-    return
+				result := AsyncResult{req, j, err}
+				done <- result
+			} else {
+				c.Errorf("Fetch error: %v", err.Error())
+				result := AsyncResult{req, nil, err}
+				done <- result
+			}
+		}(r)
+	}
+
+	c.Debugf("Waiting for %d asyncs", len(requests))
+	for i := 0; i < len(requests); i++ {
+		if result := <-done; result.err == nil {
+			results.Set(result.request, result.response)
+		}
+	}
+	return
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-    
-    c := appengine.NewContext(r)
 
-    if r.Method != "POST" {
-        http.Error(w, "POST only please", http.StatusInternalServerError)
-        return
-    }
+	c := appengine.NewContext(r)
 
-    if requests, err := parseInput(c, r); err != nil {
-        http.Error(w, err.Error(), http.StatusInternalServerError)
-        return
-    } else {
+	if r.Method != "POST" {
+		http.Error(w, "POST only please", http.StatusInternalServerError)
+		return
+	}
 
-        if results, err := getResults(c, requests); err != nil {
-            http.Error(w, err.Error(), http.StatusInternalServerError)
-            return
-        } else {
-            b, err := results.EncodePretty()
-            if err == nil {
-                w.Header().Add("content-type", "application/json")
-                fmt.Fprintf(w, string(b[:]))
-                return
-            } else {
-                http.Error(w, err.Error(), http.StatusInternalServerError)
-                return
-            }
-        }
-        
-    }
+	if requests, err := parseInput(c, r); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else {
+		if results, err := getResults(c, requests); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		} else {
+			b, err := results.EncodePretty()
+			if err == nil {
+				w.Header().Add("content-type", "application/json")
+				fmt.Fprintf(w, string(b[:]))
+				return
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+	}
 }
