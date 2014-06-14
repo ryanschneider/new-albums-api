@@ -4,6 +4,7 @@ import (
     "bytes"
     "fmt"
     "io"
+    "time"
     
     "crypto/md5"
     "net/http"
@@ -89,9 +90,11 @@ func getResults(c appengine.Context, requests []string) (results *simplejson.Jso
             //c.Debugf("Async: %v", string(b[:]))
             if err == nil {
                 j, err := simplejson.NewJson(b)
+                timeout := 5 * time.Minute
                 cache := &memcache.Item{
                     Key: key,
                     Value: b,
+                    Expiration: timeout,
                 }
 
                 if err := memcache.Add(c, cache); err != nil {
@@ -102,11 +105,13 @@ func getResults(c appengine.Context, requests []string) (results *simplejson.Jso
                 done <- result
             } else {
                 c.Errorf("ERROR: %v", err.Error())
+                result := AsyncResult{ req, nil, err }
+                done <- result
             }
         }(r)
     }
 
-    c.Infof("Waiting for %d asyncs", len(requests))
+    c.Debugf("Waiting for %d asyncs", len(requests))
     for i := 0; i < len(requests); i++ {
         if result := <-done; result.err == nil {
             results.Set(result.request, result.response)
